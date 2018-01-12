@@ -1435,3 +1435,14 @@ class ErrorInParsingArguments(VolumeDriverException):
 # GPFS driver
 class GPFSDriverUnsupportedOperation(VolumeBackendAPIException):
     message = _("GPFS driver unsupported operation: %(msg)s")
+
+# ZFS driver
+class ZFSPoolNotFound(VolumeDriverException):
+    message = _("Unable to find ZFS Pool: %(pool)s")
+
+class ZFSVolumeNotFound(VolumeDriverException):
+    message = _("Unable to find ZFS Volume: %(volume)s")
+
+class ZFSVolumeCreationFailed(VolumeDriverException):
+    message = _("Failed to create ZFS Volume: %(volume)s")
+
