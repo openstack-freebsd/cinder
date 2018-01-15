@@ -101,40 +101,54 @@ class FreeBSDZFSDriver(driver.VolumeDriver):
         else:
             return volume_path
 
-    def __snapshot_path(self, volumne_name, snapshot_name):
-        return self.__volume_path(volume_name) + '@' + snapshot_name
+    def __snapshot_path(self, volume_name, snapshot_name):
+        if snapshot_name.startswith(self.zvol_root_path):
+            return snapshot_path
+        else:
+            volume_snapshot =\
+                 volume_name.replace('/', ':') + ':' + snapshot_name
+            return self.__volume_path(volume_name) + '@' + volume_snapshot
 
     def __snapshot_name(self, snapshot_path):
-        return 
+        try:
+            if snapshot_path.startswith(self.zvol_root_path):
+                snapshot_path.rsplit(':', 1)[1]
+            return snapshot_path
+        except ValueError:
+            return snapshot_path
 
     def _sizestr(self, size_in_g):
         return '%sg' % size_in_g
     
-    def _create_volume(name, volsize):
+    def _create_volume(volume_name, volume_size):
         try:
-            self.zpool.create(name=self.__volume_path(name), 
-                              fsopts={'volsize': volsize}, 
+            self.zpool.create(name=self.__volume_path(volume_name), 
+                              fsopts={'volsize': volume_size}, 
                               fstype=zfs.DatasetType.VOLUME)
         except zfs.ZFSException:
-            raise exception.ZFSVolumeCreationFailed(volume=name)
+            _volume_name=self.__volume_name(volume_name))
+            raise exception.ZFSVolumeCreationFailed(volume=_volume_name)
             
-    def _create_volume_from_snapshot(self, volume_name, snapshot_name):
+    def _create_volume_from_snapshot(self, clone_name, volume_name, 
+                                     snapshot_name):
         try:
-            snapshot_obj = zfs.ZFS().get_snapshot(snapshot_name)
+            snapshot_path = self.__snapshot_path(volume_name, snapshot_name)
+            snapshot_obj = zfs.ZFS().get_snapshot(snapshot_path)
         except zfs.ZFSException:
             raise exception.ZFSVolumeNotFound(volume=volume_name)
         
         try:
-            snapshot_obj.clone(name=volume_name)
+            _clone_name = self.__volume_name(clone_name)
+            snapshot_obj.clone(name=self.__volume_path(_clone_name))
         except zfs.ZFSException:
-            raise exception.ZFSVolumeCreationFailed(volume=volume_name)
+            raise exception.ZFSVolumeCreationFailed(volume=_clone_name)
             
-    def _delete_volume(self, name):
+    def _delete_volume(self, volume_name):
         try:
-            volume = zfs.ZFS().get_dataset(name)
+            volume = zfs.ZFS().get_dataset(self.__volume_path(volume_name))
             volume.delete()
         except zfs.ZFSException:
-            raise exception.ZFSVolumeNotFound(volume=name)
+            raise exception.ZFSVolumeNotFound(volume=volume_name)
 
     def check_for_setup_error(self):
         """Verify that requirements are in place to use FreeBSD ZFS driver"""
@@ -154,56 +168,27 @@ class FreeBSDZFSDriver(driver.VolumeDriver):
     
     def create_volume(self, volume):
         """Creates a ZFS Volume."""
-        self._create_volume(name=volume['name'],
-                            fsopts=self._sizestr(volume['size']))
+        self._create_volume(volume_name=volume['name'],
+                            volume_size=self._sizestr(volume['size']))
             
     def create_volume_from_snapshot(self, volume, snapshot):
         """Creates a ZFS Volume from a ZFS Snapshot."""
-        self._create_volume_from_snapshot(volume['name'], snapshot['name'])
+        self._create_volume_from_snapshot(clone_name=volume['name']
+                                          volume_name=snapshot['volume_name'], 
+                                          snapshot_name=snapshot['name'])
 
     def delete_volume(self, volume):
         """Deletes a ZFS Volume."""
-        self._delete_volume(name=volume['name'])
+        self._delete_volume(volume_name=volume['name'])
 
     def create_snapshot(self, snapshot):
         """Creates a snapshot."""
+        self._create_snapshot(self, 
+                              volume_name=snapshot['volume_name'],
+                              snapshot_name=snapshot['name'])
 
     # LVM
 
-    def update_migrated_volume(self, ctxt, volume, new_volume,
-                               original_volume_status):
-        """Return model update from LVM for migrated volume.
-
-        This method should rename the back-end volume name(id) on the
-        destination host back to its original name(id) on the source host.
-
-        :param ctxt: The context used to run the method update_migrated_volume
-        :param volume: The original volume that was migrated to this backend
-        :param new_volume: The migration volume object that was created on
-                           this backend as part of the migration process
-        :param original_volume_status: The status of the original volume
-        :returns: model_update to update DB with any needed changes
-        """
-        name_id = None
-        provider_location = None
-        if original_volume_status == 'available':
-            current_name = CONF.volume_name_template % new_volume['id']
-            original_volume_name = CONF.volume_name_template % volume['id']
-            try:
-                self.vg.rename_volume(current_name, original_volume_name)
-            except processutils.ProcessExecutionError:
-                LOG.error('Unable to rename the logical volume '
-                          'for volume: %s', volume['id'])
-                # If the rename fails, _name_id should be set to the new
-                # volume id and provider_location should be set to the
-                # one from the new volume as well.
-                name_id = new_volume['_name_id'] or new_volume['id']
-                provider_location = new_volume['provider_location']
-        else:
-            # The back-end will not be renamed.
-            name_id = new_volume['_name_id'] or new_volume['id']
-            provider_location = new_volume['provider_location']
-        return {'_name_id': name_id, 'provider_location': provider_location}
 
     def create_volume_from_snapshot(self, volume, snapshot):
         """Creates a volume from a snapshot."""
