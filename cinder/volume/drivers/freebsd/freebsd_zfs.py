@@ -35,6 +35,7 @@ from oslo_log import log as logging
 from cinder import exception
 from cinder import interface
 from cinder.volume import driver
+from cinder.image import image_utils
 
 LOG = loggin.getLogger(__name__)
 
@@ -70,49 +71,30 @@ class FreeBSDZFSDriver(driver.VolumeDriver):
         self.backend_name =\
             self.configuration.safe_get('volume_backend_name') or 'ZFS'
         
-        # Target Driver is what handles data-transport
-        # Transport specific code should NOT be in
-        # the driver (control path), this way
-        # different target drivers can be added (iscsi, FC etc)
-        target_driver = \
-            self.target_mapping[self.configuration.safe_get('iscsi_helper')]
-
-        LOG.debug('Attempting to initialize LVM driver with the '
-                  'following target_driver: %s',
-                  target_driver)
-
-        self.target_driver = importutils.import_object(
-            target_driver,
-            configuration=self.configuration,
-            db=self.db,
-            executor=self._execute)
-        self.protocol = self.target_driver.protocol
-        self._sparse_copy_volume = False
-
-    def __volume_path(self, volume_name):
+    def _volume_path(self, volume_name):
         if volume_name.startswith(self.zvol_root_path):
             return volume_name
         else:
             return self.zvol_root_path + '/' + volume_name
 
-    def __volume_name(self, volume_path):
+    def _volume_name(self, volume_path):
         if volume_path.startswith(self.zvol_root_path):
             volume_path[(len(self.zvol_root_path) + 1):]
         else:
             return volume_path
 
-    def __snapshot_path(self, volume_name, snapshot_name):
+    def _snapshot_path(self, volume_name, snapshot_name):
         if snapshot_name.startswith(self.zvol_root_path):
             return snapshot_path
         else:
             volume_snapshot =\
                  volume_name.replace('/', ':') + ':' + snapshot_name
-            return self.__volume_path(volume_name) + '@' + volume_snapshot
+            return self._volume_path(volume_name) + '@' + volume_snapshot
 
-    def __snapshot_name(self, snapshot_path):
+    def _snapshot_name(self, snapshot_path, separator=":"):
         try:
             if snapshot_path.startswith(self.zvol_root_path):
-                snapshot_path.rsplit(':', 1)[1]
+                snapshot_path.rsplit(separator, 1)[1]
             return snapshot_path
         except ValueError:
             return snapshot_path
@@ -122,34 +104,94 @@ class FreeBSDZFSDriver(driver.VolumeDriver):
     
     def _create_volume(volume_name, volume_size):
         try:
-            self.zpool.create(name=self.__volume_path(volume_name), 
+            self.zpool.create(name=volume_name,
                               fsopts={'volsize': volume_size}, 
                               fstype=zfs.DatasetType.VOLUME)
         except zfs.ZFSException:
-            _volume_name=self.__volume_name(volume_name))
-            raise exception.ZFSVolumeCreationFailed(volume=_volume_name)
+            raise exception.ZFSDatasetCreationFailed(dataset="Volume", 
+                                                     name=volume_name)
             
     def _create_volume_from_snapshot(self, clone_name, volume_name, 
-                                     snapshot_name):
+                                     snapshot_name, volume_size=None):
         try:
-            snapshot_path = self.__snapshot_path(volume_name, snapshot_name)
+            snapshot_path = self._snapshot_path(volume_name, snapshot_name)
             snapshot_obj = zfs.ZFS().get_snapshot(snapshot_path)
         except zfs.ZFSException:
-            raise exception.ZFSVolumeNotFound(volume=volume_name)
+            raise exception.ZFSDatasetNotFound(dataset="Snapshot",
+                                               name=snapshot_name)
         
         try:
-            _clone_name = self.__volume_name(clone_name)
-            snapshot_obj.clone(name=self.__volume_path(_clone_name))
+            if volume_size is None:
+                volume_size = snapshot_obj.parent.properties['volsize'].value                
+            snapshot_obj.clone(name=self._volume_path(clone_name), 
+                               opts={'volsize': volume_size})
         except zfs.ZFSException:
-            raise exception.ZFSVolumeCreationFailed(volume=_clone_name)
+            raise exception.ZFSDatasetCreationFailed(dataset="Volume",
+                                                     name=clone_name)
             
     def _delete_volume(self, volume_name):
         try:
-            volume = zfs.ZFS().get_dataset(self.__volume_path(volume_name))
+            volume = zfs.ZFS().get_dataset(self._volume_path(volume_name))
+        except zfs.ZFSException:
+            raise exception.ZFSDatasetNotFound(dataset="Volume", 
+                                               name=volume_name)
+        
+        try:
             volume.delete()
         except zfs.ZFSException:
-            raise exception.ZFSVolumeNotFound(volume=volume_name)
+            LOG.error('Unable to delete due to existing snapshot '
+                      'for ZFS Volume: %s', volume_name)
+            raise exception.VolumeIsBusy(volume_name=volume['name'])
+    
+    def _create_snapshot(self, volume_name, snapshot_name):
+        try;
+            _volume_path = self._volume_path(volume_name)
+            dataset_obj = zfs.ZFS().get_dataset(_volume_path)
+        except zfs.ZFSException:
+            raise exception.ZFSDatasetNotFound(dataset="Volume",
+                                               name=volume_name)
+        
+        try:
+            _snapshot_path = self._snapshot_name(volume_name, snapshot_name)
+            dataset_obj.snapshot(self._snapshot_name(_snapshot_path, "@"))
+        except zfs.ZFSException:
+            raise exception.ZFSDatasetCreationFailed(dataset='Snapshot', 
+                                                     name=snapshot_name)
+    
+    def _delete_snapshot(self, volume_name, snapshot_name):
+        try:
+            _snapshot_path = self._snapshot_name(volume_name, snapshot_name)
+            snapshot_obj = zfs.ZFS().get_snapshot(_snapshot_path)
+        except zfs.ZFSException:
+            raise exception.ZFSDatasetNotFound(dataset='Snapshot', 
+                                               name=snapshot_name)
+                                               
+        try:
+            snapshot_obj.delete()
+        except zfs.ZFSException:
+            raise exception.ZFSDatasetRemoveFailed(dataset='Snapshot', 
+                                                   name=snapshot_name)            
 
+    def _update_volume_stats():
+        data = {}
+        data['volume_backend_name'] = self.volume_backend_name
+        data['vendor_name'] = 'Open Source'
+        data['driver_version'] = '5000'
+        data['storage_protocol'] = 'ZFS'
+        data['consistencygroup_support'] = False
+        data['QoS_support'] = False
+        data['thin_provisioning_support'] = True
+        data['thick_provisioning_support'] = False
+        data['reserved_percentage'] = self.zpool.properties['capacity'].value
+
+        data['free_capacity_gb'] = self.zpool.properties['free'].value
+        data['total_capacity_gb'] = self.zpool.properties['size'].value
+        data['provisioned_capacity_gb'] =\
+            self.zpool.properties['allocated'].value
+        data['pool_name'] = self.zpool.name
+
+        return data
+        
     def check_for_setup_error(self):
         """Verify that requirements are in place to use FreeBSD ZFS driver"""
         if self.zpool is None:
@@ -164,125 +206,41 @@ class FreeBSDZFSDriver(driver.VolumeDriver):
         except:
             self.zpool.create(name=self.zvol_root_path)
         except zfs.ZFSException:
-            raise exception.ZFSVolumeCreationFailed(volume=self.zvol_root_path)
+            raise exception.ZFSDatasetCreationFailed(dataset="Volume",
+                                                     name=self.zvol_root_path)
     
     def create_volume(self, volume):
         """Creates a ZFS Volume."""
-        self._create_volume(volume_name=volume['name'],
+        self._create_volume(volume_name=self._volume_name(volume['name']),
                             volume_size=self._sizestr(volume['size']))
             
     def create_volume_from_snapshot(self, volume, snapshot):
         """Creates a ZFS Volume from a ZFS Snapshot."""
-        self._create_volume_from_snapshot(clone_name=volume['name']
-                                          volume_name=snapshot['volume_name'], 
-                                          snapshot_name=snapshot['name'])
+        self._create_volume_from_snapshot(
+            clone_name=self._volume_name(volume['name']),
+            volume_name=self._volume_name(snapshot['volume_name']),
+            snapshot_name=self._snapshot_name(snapshot['name']),
+            volume_size=self._sizestr(volume['size']))
 
     def delete_volume(self, volume):
         """Deletes a ZFS Volume."""
-        self._delete_volume(volume_name=volume['name'])
+        self._delete_volume(volume_name=self._volume_name(volume['name']))
 
     def create_snapshot(self, snapshot):
         """Creates a snapshot."""
-        self._create_snapshot(self, 
-                              volume_name=snapshot['volume_name'],
-                              snapshot_name=snapshot['name'])
-
-    # LVM
-
-
-    def create_volume_from_snapshot(self, volume, snapshot):
-        """Creates a volume from a snapshot."""
-        if self.configuration.lvm_type == 'thin':
-            self.vg.create_lv_snapshot(volume['name'],
-                                       self._escape_snapshot(snapshot['name']),
-                                       self.configuration.lvm_type)
-            if volume['size'] > snapshot['volume_size']:
-                LOG.debug("Resize the new volume to %s.", volume['size'])
-                self.extend_volume(volume, volume['size'])
-            self.vg.activate_lv(volume['name'], is_snapshot=True,
-                                permanent=True)
-            return
-        self._create_volume(volume['name'],
-                            self._sizestr(volume['size']),
-                            self.configuration.lvm_type,
-                            self.configuration.lvm_mirrors)
-
-        # Some configurations of LVM do not automatically activate
-        # ThinLVM snapshot LVs.
-        self.vg.activate_lv(snapshot['name'], is_snapshot=True)
-
-        # copy_volume expects sizes in MiB, we store integer GiB
-        # be sure to convert before passing in
-        volutils.copy_volume(self.local_path(snapshot),
-                             self.local_path(volume),
-                             snapshot['volume_size'] * units.Ki,
-                             self.configuration.volume_dd_blocksize,
-                             execute=self._execute,
-                             sparse=self._sparse_copy_volume)
-
-    def delete_volume(self, volume):
-        """Deletes a logical volume."""
-
-        # NOTE(jdg):  We don't need to explicitly call
-        # remove export here because we already did it
-        # in the manager before we got here.
-
-        if self._volume_not_present(volume['name']):
-            # If the volume isn't present, then don't attempt to delete
-            return True
-
-        if self.vg.lv_has_snapshot(volume['name']):
-            LOG.error('Unable to delete due to existing snapshot '
-                      'for volume: %s', volume['name'])
-            raise exception.VolumeIsBusy(volume_name=volume['name'])
-
-        self._delete_volume(volume)
-        LOG.info('Successfully deleted volume: %s', volume['id'])
-
-    def create_snapshot(self, snapshot):
-        """Creates a snapshot."""
-
-        self.vg.create_lv_snapshot(self._escape_snapshot(snapshot['name']),
-                                   snapshot['volume_name'],
-                                   self.configuration.lvm_type)
+        self._create_snapshot(
+            volume_name=self._volume_name(snapshot['volume_name']),
+            snapshot_name=self._snapshot_name(snapshot['name']))
 
     def delete_snapshot(self, snapshot):
         """Deletes a snapshot."""
-        if self._volume_not_present(self._escape_snapshot(snapshot['name'])):
-            # If the snapshot isn't present, then don't attempt to delete
-            LOG.warning("snapshot: %s not found, "
-                        "skipping delete operations", snapshot['name'])
-            LOG.info('Successfully deleted snapshot: %s', snapshot['id'])
-            return True
-
-        # TODO(yamahata): zeroing out the whole snapshot triggers COW.
-        # it's quite slow.
-        self._delete_volume(snapshot, is_snapshot=True)
-
-    def revert_to_snapshot(self, context, volume, snapshot):
-        """Revert a volume to a snapshot"""
-
-        # NOTE(tommylikehu): We still can revert the volume because Cinder
-        # will try the alternative approach if 'NotImplementedError'
-        # is raised here.
-        if self.configuration.lvm_type == 'thin':
-            msg = _("Revert volume to snapshot not implemented for thin LVM.")
-            raise NotImplementedError(msg)
-        else:
-            self.vg.revert(self._escape_snapshot(snapshot.name))
-            self.vg.deactivate_lv(volume.name)
-            self.vg.activate_lv(volume.name)
-            # Recreate the snapshot that was destroyed by the revert
-            self.create_snapshot(snapshot)
-
-    def local_path(self, volume, vg=None):
-        if vg is None:
-            vg = self.configuration.volume_group
-        # NOTE(vish): stops deprecation warning
-        escaped_group = vg.replace('-', '--')
-        escaped_name = self._escape_snapshot(volume['name']).replace('-', '--')
-        return "/dev/mapper/%s-%s" % (escaped_group, escaped_name)
-
+        self._delete_snapshot(
+            volume_name=self._volume_name(snapshot['volume_name']),
+            snapshot_name=self._snapshot_name(snapshot['name']))
+            
+    def local_path(self, volume):
+        return ("/dev/zvol/" + self._volume_path(volume))
+        
     def copy_image_to_volume(self, context, volume, image_service, image_id):
         """Fetch the image from image_service and write it to the volume."""
         image_utils.fetch_to_raw(context,
@@ -290,7 +248,7 @@ class FreeBSDZFSDriver(driver.VolumeDriver):
                                  image_id,
                                  self.local_path(volume),
                                  self.configuration.volume_dd_blocksize,
-                                 size=volume['size'])
+                                 size=volume['size'])    
 
     def copy_volume_to_image(self, context, volume, image_service, image_meta):
         """Copy the volume to the specified image."""
@@ -298,52 +256,14 @@ class FreeBSDZFSDriver(driver.VolumeDriver):
                                   image_service,
                                   image_meta,
                                   self.local_path(volume))
-
+    
     def create_cloned_volume(self, volume, src_vref):
         """Creates a clone of the specified volume."""
-        if self.configuration.lvm_type == 'thin':
-            self.vg.create_lv_snapshot(volume['name'],
-                                       src_vref['name'],
-                                       self.configuration.lvm_type)
-            if volume['size'] > src_vref['size']:
-                LOG.debug("Resize the new volume to %s.", volume['size'])
-                self.extend_volume(volume, volume['size'])
-            self.vg.activate_lv(volume['name'], is_snapshot=True,
-                                permanent=True)
-            return
-
-        mirror_count = 0
-        if self.configuration.lvm_mirrors:
-            mirror_count = self.configuration.lvm_mirrors
-        LOG.info('Creating clone of volume: %s', src_vref['id'])
-        volume_name = src_vref['name']
-        temp_id = 'tmp-snap-%s' % volume['id']
-        temp_snapshot = {'volume_name': volume_name,
-                         'size': src_vref['size'],
-                         'volume_size': src_vref['size'],
-                         'name': 'clone-snap-%s' % volume['id'],
-                         'id': temp_id}
-
-        self.create_snapshot(temp_snapshot)
-
-        # copy_volume expects sizes in MiB, we store integer GiB
-        # be sure to convert before passing in
-        try:
-            self._create_volume(volume['name'],
-                                self._sizestr(volume['size']),
-                                self.configuration.lvm_type,
-                                mirror_count)
-
-            self.vg.activate_lv(temp_snapshot['name'], is_snapshot=True)
-            volutils.copy_volume(
-                self.local_path(temp_snapshot),
-                self.local_path(volume),
-                src_vref['size'] * units.Ki,
-                self.configuration.volume_dd_blocksize,
-                execute=self._execute,
-                sparse=self._sparse_copy_volume)
-        finally:
-            self.delete_snapshot(temp_snapshot)
+        snapshot={'volume_name': src_vref['name'],
+                  'snapshot': 'for_clone'}
+        self.create_snapshot(snapshot)
+        self.create_volume_from_snapshot(volume, snapshot)
+        self.delete_snapshot(snapshot)
 
     def clone_image(self, context, volume,
                     image_location, image_meta,
@@ -357,9 +277,12 @@ class FreeBSDZFSDriver(driver.VolumeDriver):
         """
 
         if refresh:
-            self._update_volume_stats()
+            self._stats = self._update_volume_stats()
 
         return self._stats
+    
+    # LVM
+
 
     def extend_volume(self, volume, new_size):
         """Extend an existing volume's size."""
@@ -635,364 +558,3 @@ class FreeBSDZFSDriver(driver.VolumeDriver):
         self.target_driver.terminate_connection(volume, connector,
                                                 **kwargs)
         return has_shared_connections
-    
-
-
-
-
-
-
-    
-class VolumeDriver(ManageableVD, CloneableImageVD, ManageableSnapshotsVD,
-                   MigrateVD, BaseVD):
-    def check_for_setup_error(self):
-        raise NotImplementedError()
-
-    def create_volume(self, volume):
-        raise NotImplementedError()
-
-    def create_volume_from_snapshot(self, volume, snapshot):
-        """Creates a volume from a snapshot.
-
-        If volume_type extra specs includes 'replication: <is> True'
-        the driver needs to create a volume replica (secondary),
-        and setup replication between the newly created volume and
-        the secondary volume.
-        """
-
-        raise NotImplementedError()
-
-    def create_replica_test_volume(self, volume, src_vref):
-        raise NotImplementedError()
-
-    def delete_volume(self, volume):
-        raise NotImplementedError()
-
-    def create_snapshot(self, snapshot):
-        """Creates a snapshot."""
-        raise NotImplementedError()
-
-    def delete_snapshot(self, snapshot):
-        """Deletes a snapshot."""
-        raise NotImplementedError()
-
-    def local_path(self, volume):
-        raise NotImplementedError()
-
-    def clear_download(self, context, volume):
-        pass
-
-    def extend_volume(self, volume, new_size):
-        msg = _("Extend volume not implemented")
-        raise NotImplementedError(msg)
-
-    def manage_existing(self, volume, existing_ref):
-        msg = _("Manage existing volume not implemented.")
-        raise NotImplementedError(msg)
-
-    def revert_to_snapshot(self, context, volume, snapshot):
-        """Revert volume to snapshot.
-
-        Note: the revert process should not change the volume's
-        current size, that means if the driver shrank
-        the volume during the process, it should extend the
-        volume internally.
-        """
-        msg = _("Revert volume to snapshot not implemented.")
-        raise NotImplementedError(msg)
-
-    def manage_existing_get_size(self, volume, existing_ref):
-        msg = _("Manage existing volume not implemented.")
-        raise NotImplementedError(msg)
-
-    def get_manageable_volumes(self, cinder_volumes, marker, limit, offset,
-                               sort_keys, sort_dirs):
-        msg = _("Get manageable volumes not implemented.")
-        raise NotImplementedError(msg)
-
-    def unmanage(self, volume):
-        pass
-
-    def manage_existing_snapshot(self, snapshot, existing_ref):
-        msg = _("Manage existing snapshot not implemented.")
-        raise NotImplementedError(msg)
-
-    def manage_existing_snapshot_get_size(self, snapshot, existing_ref):
-        msg = _("Manage existing snapshot not implemented.")
-        raise NotImplementedError(msg)
-
-    def get_manageable_snapshots(self, cinder_snapshots, marker, limit, offset,
-                                 sort_keys, sort_dirs):
-        msg = _("Get manageable snapshots not implemented.")
-        raise NotImplementedError(msg)
-
-    def unmanage_snapshot(self, snapshot):
-        """Unmanage the specified snapshot from Cinder management."""
-
-    def retype(self, context, volume, new_type, diff, host):
-        return False, None
-
-    # #######  Interface methods for DataPath (Connector) ########
-    def ensure_export(self, context, volume):
-        raise NotImplementedError()
-
-    def create_export(self, context, volume, connector):
-        raise NotImplementedError()
-
-    def create_export_snapshot(self, context, snapshot, connector):
-        raise NotImplementedError()
-
-    def remove_export(self, context, volume):
-        raise NotImplementedError()
-
-    def remove_export_snapshot(self, context, snapshot):
-        raise NotImplementedError()
-
-    def initialize_connection(self, volume, connector, **kwargs):
-        raise NotImplementedError()
-
-    def initialize_connection_snapshot(self, snapshot, connector, **kwargs):
-        """Allow connection from connector for a snapshot."""
-
-    def terminate_connection(self, volume, connector, **kwargs):
-        """Disallow connection from connector
-
-        :param volume: The volume to be disconnected.
-        :param connector: A dictionary describing the connection with details
-                          about the initiator. Can be None.
-        """
-
-    def terminate_connection_snapshot(self, snapshot, connector, **kwargs):
-        """Disallow connection from connector for a snapshot."""
-
-    def create_consistencygroup(self, context, group):
-        """Creates a consistencygroup.
-
-        :param context: the context of the caller.
-        :param group: the dictionary of the consistency group to be created.
-        :returns: model_update
-
-        model_update will be in this format: {'status': xxx, ......}.
-
-        If the status in model_update is 'error', the manager will throw
-        an exception and it will be caught in the try-except block in the
-        manager. If the driver throws an exception, the manager will also
-        catch it in the try-except block. The group status in the db will
-        be changed to 'error'.
-
-        For a successful operation, the driver can either build the
-        model_update and return it or return None. The group status will
-        be set to 'available'.
-        """
-        raise NotImplementedError()
-
-    def create_consistencygroup_from_src(self, context, group, volumes,
-                                         cgsnapshot=None, snapshots=None,
-                                         source_cg=None, source_vols=None):
-        """Creates a consistencygroup from source.
-
-        :param context: the context of the caller.
-        :param group: the dictionary of the consistency group to be created.
-        :param volumes: a list of volume dictionaries in the group.
-        :param cgsnapshot: the dictionary of the cgsnapshot as source.
-        :param snapshots: a list of snapshot dictionaries in the cgsnapshot.
-        :param source_cg: the dictionary of a consistency group as source.
-        :param source_vols: a list of volume dictionaries in the source_cg.
-        :returns: model_update, volumes_model_update
-
-        The source can be cgsnapshot or a source cg.
-
-        param volumes is retrieved directly from the db. It is a list of
-        cinder.db.sqlalchemy.models.Volume to be precise. It cannot be
-        assigned to volumes_model_update. volumes_model_update is a list of
-        dictionaries. It has to be built by the driver. An entry will be
-        in this format: {'id': xxx, 'status': xxx, ......}. model_update
-        will be in this format: {'status': xxx, ......}.
-
-        To be consistent with other volume operations, the manager will
-        assume the operation is successful if no exception is thrown by
-        the driver. For a successful operation, the driver can either build
-        the model_update and volumes_model_update and return them or
-        return None, None.
-        """
-        raise NotImplementedError()
-
-    def delete_consistencygroup(self, context, group, volumes):
-        """Deletes a consistency group.
-
-        :param context: the context of the caller.
-        :param group: the dictionary of the consistency group to be deleted.
-        :param volumes: a list of volume dictionaries in the group.
-        :returns: model_update, volumes_model_update
-
-        param volumes is retrieved directly from the db. It is a list of
-        cinder.db.sqlalchemy.models.Volume to be precise. It cannot be
-        assigned to volumes_model_update. volumes_model_update is a list of
-        dictionaries. It has to be built by the driver. An entry will be
-        in this format: {'id': xxx, 'status': xxx, ......}. model_update
-        will be in this format: {'status': xxx, ......}.
-
-        The driver should populate volumes_model_update and model_update
-        and return them.
-
-        The manager will check volumes_model_update and update db accordingly
-        for each volume. If the driver successfully deleted some volumes
-        but failed to delete others, it should set statuses of the volumes
-        accordingly so that the manager can update db correctly.
-
-        If the status in any entry of volumes_model_update is 'error_deleting'
-        or 'error', the status in model_update will be set to the same if it
-        is not already 'error_deleting' or 'error'.
-
-        If the status in model_update is 'error_deleting' or 'error', the
-        manager will raise an exception and the status of the group will be
-        set to 'error' in the db. If volumes_model_update is not returned by
-        the driver, the manager will set the status of every volume in the
-        group to 'error' in the except block.
-
-        If the driver raises an exception during the operation, it will be
-        caught by the try-except block in the manager. The statuses of the
-        group and all volumes in it will be set to 'error'.
-
-        For a successful operation, the driver can either build the
-        model_update and volumes_model_update and return them or
-        return None, None. The statuses of the group and all volumes
-        will be set to 'deleted' after the manager deletes them from db.
-        """
-        raise NotImplementedError()
-
-    def update_consistencygroup(self, context, group,
-                                add_volumes=None, remove_volumes=None):
-        """Updates a consistency group.
-
-        :param context: the context of the caller.
-        :param group: the dictionary of the consistency group to be updated.
-        :param add_volumes: a list of volume dictionaries to be added.
-        :param remove_volumes: a list of volume dictionaries to be removed.
-        :returns: model_update, add_volumes_update, remove_volumes_update
-
-        model_update is a dictionary that the driver wants the manager
-        to update upon a successful return. If None is returned, the manager
-        will set the status to 'available'.
-
-        add_volumes_update and remove_volumes_update are lists of dictionaries
-        that the driver wants the manager to update upon a successful return.
-        Note that each entry requires a {'id': xxx} so that the correct
-        volume entry can be updated. If None is returned, the volume will
-        remain its original status. Also note that you cannot directly
-        assign add_volumes to add_volumes_update as add_volumes is a list of
-        cinder.db.sqlalchemy.models.Volume objects and cannot be used for
-        db update directly. Same with remove_volumes.
-
-        If the driver throws an exception, the status of the group as well as
-        those of the volumes to be added/removed will be set to 'error'.
-        """
-        raise NotImplementedError()
-
-    def create_cgsnapshot(self, context, cgsnapshot, snapshots):
-        """Creates a cgsnapshot.
-
-        :param context: the context of the caller.
-        :param cgsnapshot: the dictionary of the cgsnapshot to be created.
-        :param snapshots: a list of snapshot dictionaries in the cgsnapshot.
-        :returns: model_update, snapshots_model_update
-
-        param snapshots is retrieved directly from the db. It is a list of
-        cinder.db.sqlalchemy.models.Snapshot to be precise. It cannot be
-        assigned to snapshots_model_update. snapshots_model_update is a list
-        of dictionaries. It has to be built by the driver. An entry will be
-        in this format: {'id': xxx, 'status': xxx, ......}. model_update
-        will be in this format: {'status': xxx, ......}.
-
-        The driver should populate snapshots_model_update and model_update
-        and return them.
-
-        The manager will check snapshots_model_update and update db accordingly
-        for each snapshot. If the driver successfully deleted some snapshots
-        but failed to delete others, it should set statuses of the snapshots
-        accordingly so that the manager can update db correctly.
-
-        If the status in any entry of snapshots_model_update is 'error', the
-        status in model_update will be set to the same if it is not already
-        'error'.
-
-        If the status in model_update is 'error', the manager will raise an
-        exception and the status of cgsnapshot will be set to 'error' in the
-        db. If snapshots_model_update is not returned by the driver, the
-        manager will set the status of every snapshot to 'error' in the except
-        block.
-
-        If the driver raises an exception during the operation, it will be
-        caught by the try-except block in the manager and the statuses of
-        cgsnapshot and all snapshots will be set to 'error'.
-
-        For a successful operation, the driver can either build the
-        model_update and snapshots_model_update and return them or
-        return None, None. The statuses of cgsnapshot and all snapshots
-        will be set to 'available' at the end of the manager function.
-        """
-        raise NotImplementedError()
-
-    def delete_cgsnapshot(self, context, cgsnapshot, snapshots):
-        """Deletes a cgsnapshot.
-
-        :param context: the context of the caller.
-        :param cgsnapshot: the dictionary of the cgsnapshot to be deleted.
-        :param snapshots: a list of snapshot dictionaries in the cgsnapshot.
-        :returns: model_update, snapshots_model_update
-
-        param snapshots is retrieved directly from the db. It is a list of
-        cinder.db.sqlalchemy.models.Snapshot to be precise. It cannot be
-        assigned to snapshots_model_update. snapshots_model_update is a list
-        of dictionaries. It has to be built by the driver. An entry will be
-        in this format: {'id': xxx, 'status': xxx, ......}. model_update
-        will be in this format: {'status': xxx, ......}.
-
-        The driver should populate snapshots_model_update and model_update
-        and return them.
-
-        The manager will check snapshots_model_update and update db accordingly
-        for each snapshot. If the driver successfully deleted some snapshots
-        but failed to delete others, it should set statuses of the snapshots
-        accordingly so that the manager can update db correctly.
-
-        If the status in any entry of snapshots_model_update is
-        'error_deleting' or 'error', the status in model_update will be set to
-        the same if it is not already 'error_deleting' or 'error'.
-
-        If the status in model_update is 'error_deleting' or 'error', the
-        manager will raise an exception and the status of cgsnapshot will be
-        set to 'error' in the db. If snapshots_model_update is not returned by
-        the driver, the manager will set the status of every snapshot to
-        'error' in the except block.
-
-        If the driver raises an exception during the operation, it will be
-        caught by the try-except block in the manager and the statuses of
-        cgsnapshot and all snapshots will be set to 'error'.
-
-        For a successful operation, the driver can either build the
-        model_update and snapshots_model_update and return them or
-        return None, None. The statuses of cgsnapshot and all snapshots
-        will be set to 'deleted' after the manager deletes them from db.
-        """
-        raise NotImplementedError()
-
-    def clone_image(self, volume, image_location, image_id, image_meta,
-                    image_service):
-        return None, False
-
-    def get_pool(self, volume):
-        """Return pool name where volume reside on.
-
-        :param volume: The volume hosted by the driver.
-        :returns: name of the pool where given volume is in.
-        """
-        return None
-
-    def migrate_volume(self, context, volume, host):
-        return (False, None)
-
-    def accept_transfer(self, context, volume, new_user, new_project):
-        pass
-
-    

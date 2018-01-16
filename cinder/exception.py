@@ -1440,9 +1440,12 @@ class GPFSDriverUnsupportedOperation(VolumeBackendAPIException):
 class ZFSPoolNotFound(VolumeDriverException):
     message = _("Unable to find ZFS Pool: %(pool)s")
 
-class ZFSVolumeNotFound(VolumeDriverException):
-    message = _("Unable to find ZFS Volume: %(volume)s")
+class ZFSDatasetNotFound(VolumeDriverException):
+    message = _("Unable to find ZFS %(dataset)s: %(name)s")
 
-class ZFSVolumeCreationFailed(VolumeDriverException):
-    message = _("Failed to create ZFS Volume: %(volume)s")
+class ZFSDatasetCreationFailed(VolumeDriverException):
+    message = _("Failed to create ZFS %(dataset)s: %(name)s")
+
+class ZFSDatasetRemoveFailed(VolumeDriverException):
+    message = _("Failed to remove ZFS %(dataset)s: %(name)s")
 
